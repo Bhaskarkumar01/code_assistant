@@ -1,25 +1,23 @@
-import hashlib
-import hmac
+import time
+import logging
 
-# Example stored user data with hashed password (hash of "1234")
-stored_users = {
-    "admin": "81dc9bdb52d04dc20036dbd8313ed055"  # MD5 hash of "1234"
-}
+logging.basicConfig(level=logging.WARNING)
 
 def authenticate_user(username, password):
-    if not isinstance(username, str) or not isinstance(password, str):
-        return False
-
-    stored_password_hash = stored_users.get(username)
-    if not stored_password_hash:
-        # User not found
-        return False
-
-    # Hash the provided password
-    password_hash = hashlib.md5(password.encode()).hexdigest()
-
-    # Use hmac.compare_digest to prevent timing attacks
-    if hmac.compare_digest(password_hash, stored_password_hash):
+    # Simulate a user data store
+    valid_users = {
+        "admin": "1234"
+    }
+    
+    # Introduce a fixed delay to mitigate brute force attacks
+    time.sleep(0.5)
+    
+    # Check if username exists and password matches
+    if username in valid_users and valid_users[username] == password:
         return True
-
+    
+    # Log the failed attempt without revealing which part was incorrect
+    logging.warning(f"Failed login attempt for username: {username}")
+    
+    # Return False without revealing details
     return False

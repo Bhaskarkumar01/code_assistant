@@ -12,7 +12,11 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from agents import create_investigator, create_final_agent, create_developer
+from agents import (
+    create_investigator,
+    create_developer,
+    create_evaluator,
+)
 from rag import build_rag
 from tools import create_tools
 
@@ -25,6 +29,11 @@ class AgentState(TypedDict):
     test_passed: bool
     attempts: int
     investigation: str
+    relevant_files: list[str]
+    evidence_sufficient: bool
+    evidence_reason: str
+    next_query: str
+    retrieval_attempts: int
 
 
 def build_graph(repo_path):
@@ -32,8 +41,8 @@ def build_graph(repo_path):
     tools = create_tools(db, repo_path)
 
     investigator = create_investigator(tools)
-    final_agent = create_final_agent()
     developer = create_developer()
+    evaluator = create_evaluator()
 
     source = Path(repo_path).resolve()
     destination = source.parent / "repaired_repo"
@@ -42,7 +51,7 @@ def build_graph(repo_path):
         content=(
             "You are a Python code investigator. "
             "Use search_code to find relevant source code. "
-            "Explain the relevant function, likely bug, and affected file. "
+            "Identify the likely faulty function and affected files. "
             "Do not repeatedly search for the same information."
         )
     )
@@ -56,16 +65,16 @@ def build_graph(repo_path):
     def route_agent(state: AgentState):
         last_message = state["messages"][-1]
 
-        if not last_message.tool_calls:
-            return "developer"
+        if getattr(last_message, "tool_calls", None):
+            if state["tool_count"] >= 3:
+                return "evaluate"
+            return "tools"
 
-        if state["tool_count"] >= 3:
-            return "final"
-
-        return "tools"
+        return "evaluate"
 
     def tools_node(state: AgentState):
         results = ToolNode(tools).invoke(state)
+
         return {
             "messages": results["messages"],
             "tool_count": state["tool_count"] + len(
@@ -73,58 +82,147 @@ def build_graph(repo_path):
             )
         }
 
-    def final_node(state: AgentState):
-        messages = state["messages"]
+    def evaluate_node(state: AgentState):
+        original_request = state["messages"][0].content
 
-        if messages[-1].type == "ai" and messages[-1].tool_calls:
-            messages = messages[:-1]
+        retrieved = "\n\n".join(
+            str(message.content)
+            for message in state["messages"]
+            if message.type == "tool"
+        )
 
-        response = final_agent.invoke(
-            [system_prompt] + messages + [
+        if not retrieved.strip():
+            return {
+                "evidence_sufficient": False,
+                "evidence_reason": "No code was retrieved.",
+                "next_query": str(original_request),
+                "relevant_files": [],
+                "retrieval_attempts": state["retrieval_attempts"] + 1
+            }
+
+        evaluation = evaluator.invoke(
+            f"""
+You are evaluating retrieved Python code for a bug repair task.
+
+User request:
+{original_request}
+
+Retrieved code:
+{retrieved}
+
+Determine whether the retrieved code is sufficient to
+identify the likely faulty function and affected source files.
+
+Mark sufficient=True only when the evidence supports
+a concrete diagnosis.
+
+Return relevant_files using exact file paths shown in
+the retrieved code.
+
+If evidence is insufficient, provide a different,
+more specific search query in next_query.
+
+Do not invent filenames.
+"""
+        )
+
+        valid_files = {
+            path.relative_to(source).as_posix()
+            for path in source.rglob("*.py")
+        }
+
+        relevant_files = [
+            name for name in evaluation.relevant_files
+            if name in valid_files
+            and not Path(name).name.startswith("test_")
+        ]
+
+        print("\nEVIDENCE EVALUATION:")
+        print("Sufficient:", evaluation.sufficient)
+        print("Reason:", evaluation.reason)
+        print("Relevant files:", relevant_files)
+
+        return {
+            "evidence_sufficient": evaluation.sufficient,
+            "evidence_reason": evaluation.reason,
+            "next_query": evaluation.next_query,
+            "relevant_files": relevant_files,
+            "retrieval_attempts": state["retrieval_attempts"] + 1
+        }
+
+    def route_evaluation(state: AgentState):
+        if state["evidence_sufficient"] and state["relevant_files"]:
+            return "developer"
+
+        if state["retrieval_attempts"] >= 3:
+            return "developer" if state["relevant_files"] else END
+
+        if state["tool_count"] >= 3:
+            return "developer" if state["relevant_files"] else END
+
+        return "refine"
+
+    def refine_node(state: AgentState):
+        query = state["next_query"].strip()
+
+        if not query:
+            query = str(state["messages"][0].content)
+
+        return {
+            "messages": [
                 HumanMessage(
-                    content="Summarize the relevant code and likely bug."
+                    content=(
+                        "The retrieved evidence was insufficient. "
+                        f"Reason: {state['evidence_reason']}\n"
+                        f"Search again using this query: {query}\n"
+                        "Use search_code to retrieve missing evidence."
+                    )
                 )
             ]
-        )
-        return {"messages": [response]}
+        }
 
     def developer_node(state: AgentState):
         attempt = state["attempts"] + 1
 
-        # Copy original repository only on the first attempt
+        # Copy the repository only on the first repair attempt
         if attempt == 1:
             if destination.exists():
                 shutil.rmtree(destination)
             shutil.copytree(source, destination)
 
-        files = {}
-        for path in destination.rglob("*.py"):
-            relative = path.relative_to(destination).as_posix()
-            files[relative] = path.read_text(encoding="utf-8")
+        all_files = {
+            path.relative_to(destination).as_posix():
+            path.read_text(encoding="utf-8")
+            for path in destination.rglob("*.py")
+        }
+
+        # Only send RAG-selected source files to the Developer
+        selected_files = {
+            name: all_files[name]
+            for name in state["relevant_files"]
+            if name in all_files
+        }
+
+        if not selected_files:
+            raise ValueError("No relevant source files selected for repair")
 
         original_request = state["messages"][0].content
 
-        # Use investigator's findings and retrieved code
-        investigation = state.get("investigation", "")
-
-        if not investigation:
-            investigation = "\n".join(
-                str(message.content)
-                for message in state["messages"][1:]
-                if message.type in ("ai", "tool")
-                and not getattr(message, "tool_calls", None)
-            )
+        investigation = "\n".join(
+            str(message.content)
+            for message in state["messages"][1:]
+            if message.type == "ai"
+            and not getattr(message, "tool_calls", None)
+        )
 
         has_tests = any(
-            path.name.startswith("test_")
-            and path.suffix == ".py"
-            for path in destination.rglob("*.py")
+            Path(name).name.startswith("test_")
+            for name in all_files
         )
 
         code_context = "\n\n".join(
             f"FILE: {name}\n{code}"
-            for name, code in files.items()
-            if not name.startswith("test_")
+            for name, code in selected_files.items()
         )
 
         fix = developer.invoke(
@@ -137,7 +235,10 @@ User request:
 Investigator findings:
 {investigation}
 
-Repository code:
+Evidence evaluation:
+{state["evidence_reason"]}
+
+Relevant repository code:
 {code_context}
 
 Previous test results:
@@ -160,13 +261,13 @@ Do not use network calls or external services.
 """
         )
 
-        if fix.filename not in files or fix.filename.startswith("test_"):
-            raise ValueError("Developer selected an invalid source file")
+        if fix.filename not in selected_files:
+            raise ValueError("Developer selected a file outside retrieved context")
 
         ast.parse(fix.code)
 
         target = destination / fix.filename
-        old_code = files[fix.filename]
+        old_code = selected_files[fix.filename]
         target.write_text(fix.code, encoding="utf-8")
 
         if not has_tests and fix.test_code.strip():
@@ -197,7 +298,7 @@ Do not use network calls or external services.
                     content=f"Developer completed attempt {attempt}: {fix.explanation}"
                 )
             ],
-            "diff": diff,
+            "diff": diff if diff else state["diff"],
             "attempts": attempt,
             "investigation": investigation
         }
@@ -230,9 +331,6 @@ Do not use network calls or external services.
 
         output = result.stdout + "\n" + result.stderr
         passed = result.returncode == 0
-        if state['attempts']==1:
-            passed=False
-            output += "\nSimulated failure for retry testing."
 
         print(f"\nVALIDATOR - Attempt {state['attempts']}/3")
         print(output)
@@ -243,8 +341,6 @@ Do not use network calls or external services.
             "test_passed": passed
         }
 
-    
-
     def route_validator(state: AgentState):
         if state["test_passed"] or state["attempts"] >= 3:
             return END
@@ -254,15 +350,16 @@ Do not use network calls or external services.
 
     graph.add_node("investigator", agent_node)
     graph.add_node("tools", tools_node)
-    graph.add_node("final", final_node)
+    graph.add_node("evaluate", evaluate_node)
+    graph.add_node("refine", refine_node)
     graph.add_node("developer", developer_node)
     graph.add_node("validator", validator_node)
 
     graph.add_edge(START, "investigator")
     graph.add_conditional_edges("investigator", route_agent)
-
     graph.add_edge("tools", "investigator")
-    graph.add_edge("final", "developer")
+    graph.add_conditional_edges("evaluate", route_evaluation)
+    graph.add_edge("refine", "investigator")
     graph.add_edge("developer", "validator")
     graph.add_conditional_edges("validator", route_validator)
 
@@ -284,12 +381,20 @@ if __name__ == "__main__":
             "test_results": "",
             "test_passed": False,
             "attempts": 0,
-            "investigation": ""
+            "investigation": "",
+            "relevant_files": [],
+            "evidence_sufficient": False,
+            "evidence_reason": "",
+            "next_query": "",
+            "retrieval_attempts": 0
         },
-        config={"recursion_limit": 30}
+        config={"recursion_limit": 40}
     )
 
     print("\nWorkflow completed.")
-    print("Attempts:", result["attempts"])
+    print("Retrieval attempts:", result["retrieval_attempts"])
+    print("Evidence sufficient:", result["evidence_sufficient"])
+    print("Relevant files:", result["relevant_files"])
+    print("Repair attempts:", result["attempts"])
     print("Validation:", "PASS" if result["test_passed"] else "FAIL")
     print(result["test_results"])

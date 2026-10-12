@@ -30,14 +30,28 @@ if st.button("Analyze and Fix", type="primary"):
                     "test_results": "",
                     "test_passed": False,
                     "attempts": 0,
-                    "investigation": ""
+                    "investigation": "",
+                    "relevant_files": [],
+                    "evidence_sufficient": False,
+                    "evidence_reason": "",
+                    "next_query": "",
+                    "retrieval_attempts": 0
                 },
-                config={"recursion_limit": 30}
+                config={"recursion_limit": 40}
             )
 
         st.subheader("Agent Result")
-        st.write(result["messages"][-1].text)
 
+        st.write(f"Retrieval evaluations: {result['retrieval_attempts']}/3")
+
+        if result["evidence_sufficient"]:
+            st.success("Retrieved evidence is sufficient.")
+        else:
+            st.warning("Retrieved evidence was insufficient.")
+
+        st.write(result["evidence_reason"])
+
+        st.write("Relevant files:", result["relevant_files"])
         st.write(f"Repair attempts: {result['attempts']}/3")
 
         st.subheader("Code Changes")
@@ -48,9 +62,12 @@ if st.button("Analyze and Fix", type="primary"):
 
         st.subheader("Validation Results")
 
-        if result["test_passed"]:
+        if result["attempts"] == 0:
+            st.warning("No repair attempted because no relevant files were identified.")
+        elif result["test_passed"]:
             st.success("All tests passed!")
         else:
             st.warning("Validation did not pass after repair attempts.")
 
-        st.code(result["test_results"], language="text")
+        if result["test_results"]:
+            st.code(result["test_results"], language="text")

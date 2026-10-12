@@ -26,6 +26,21 @@ class CodeFix(BaseModel):
     )
 
 
+class EvidenceEvaluation(BaseModel):
+    sufficient: bool = Field(
+        description="Whether retrieved code provides enough evidence to diagnose the bug"
+    )
+    reason: str = Field(
+        description="Why the retrieved evidence is sufficient or insufficient"
+    )
+    relevant_files: list[str] = Field(
+        description="Relevant Python file paths found in retrieved evidence"
+    )
+    next_query: str = Field(
+        description="Improved search query if evidence is insufficient, otherwise empty string"
+    )
+
+
 def create_investigator(tools):
     return llm.bind_tools(tools)
 
@@ -36,3 +51,7 @@ def create_final_agent():
 
 def create_developer():
     return llm.with_structured_output(CodeFix)
+
+
+def create_evaluator():
+    return llm.with_structured_output(EvidenceEvaluation)
