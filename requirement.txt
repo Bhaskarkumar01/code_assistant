@@ -1,0 +1,8 @@
+langchain
+langchain-google-genai
+langchain-chroma
+langchain-text-splitters 
+langgraph 
+streamlit 
+python-dotenv
+langchain-openai

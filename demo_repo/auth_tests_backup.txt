@@ -1,0 +1,22 @@
+from auth import authenticate_user
+import auth
+
+
+def test_valid_credentials():
+    auth.USERS = {"admin": "secret123"}
+    assert authenticate_user("admin", "secret123") is True
+
+
+def test_invalid_password():
+    auth.USERS = {"admin": "secret123"}
+    assert authenticate_user("admin", "wrong") is False
+
+
+def test_unknown_user():
+    auth.USERS = {"admin": "secret123"}
+    assert authenticate_user("unknown", "secret123") is False
+
+
+def test_invalid_input():
+    auth.USERS = {"admin": "secret123"}
+    assert authenticate_user(None, "secret123") is False
